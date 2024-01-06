@@ -1,0 +1,17 @@
+[package]
+name = "rcurs"
+version = "0.1.0"
+edition = "2021"
+description = "An oxidized RCU implementation"
+license = "MIT"
+repository = "https://github.com/threadexio/rcurs"
+readme = "README.md"
+keywords = ["rcu", "synchronization", "concurrent", "parallel", "lock-free"]
+categories = ["concurrency"]
+
+[dependencies]
+
+[features]
+default = ["std"]
+
+std = []
