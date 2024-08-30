@@ -1,28 +1,27 @@
-extern crate alloc;
-
-use core::ops::Deref;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::{marker::PhantomData, ops::Deref};
 
 use alloc::boxed::Box;
 
-use crate::Notify;
+use portable_atomic::{AtomicPtr, Ordering};
 
-/// The RCU implementation.
-pub struct Rcu<T, N>
-where
-	N: Notify,
-{
-	ptr: AtomicPtr<Inner<T, N>>,
+use crate::refs::Refs;
+
+struct Inner<T> {
+	/// The number of active references to the specific `Inner`.
+	refs: Refs,
+	/// The data.
+	data: T,
 }
 
-impl<T, N> Rcu<T, N>
-where
-	N: Notify,
-{
+/// The RCU implementation.
+pub struct Rcu<T> {
+	ptr: AtomicPtr<Inner<T>>,
+}
+
+impl<T> Rcu<T> {
 	/// Create a new [`Rcu`] with an initial value of `data`.
 	pub fn new(data: T) -> Self {
-		let ptr = Inner::new(data, N::new()).into_owned_ptr();
-
+		let ptr = alloc(Inner { data, refs: Refs::one() });
 		Self { ptr: AtomicPtr::new(ptr) }
 	}
 
@@ -32,30 +31,14 @@ where
 	/// [`update`] returns. You must make sure that when calling this function
 	/// the new value is fully initialized beforehand.
 	///
-	/// This function _will_ block execution until all guards referring to the
-	/// old value are dropped.
+	/// This function does _not_ block execution.
 	///
 	/// [`get`]: Self::get
 	/// [`update`]: Self::update
-	pub fn update(&self, new: T) -> T {
-		let new_ptr = Inner::new(new, N::new()).into_owned_ptr();
-
+	pub fn update(&self, new: T) {
+		let new_ptr = alloc(Inner { data: new, refs: Refs::one() });
 		let old_ptr = self.ptr.swap(new_ptr, Ordering::Relaxed);
-		// Any new refs past this point reference the new data.
-
-		/* SAFETY:
-		 * We can't call from_owned_ptr right away because that function
-		 * will move Inner in memory and invalidate any references that
-		 * might still exist.
-		 */
-		let old_ref = unsafe { &*old_ptr };
-
-		// Notify must be called only when there are no more refs.
-		old_ref.notify.wait();
-
-		// Now it is safe to move Inner as no references to it exist.
-		let old = Inner::from_owned_ptr(old_ptr);
-		old.data
+		unsafe { drop_inner(old_ptr) };
 	}
 
 	/// Get the value inside the [`Rcu`].
@@ -72,96 +55,60 @@ where
 	/// This function does _not_ block execution.
 	///
 	/// [`update`]: Self::update
-	pub fn get(&self) -> Guard<'_, T, N> {
-		let inner = unsafe { &*self.ptr.load(Ordering::Relaxed) };
-		inner.refs.fetch_add(1, Ordering::Relaxed);
-		Guard { inner }
+	pub fn get(&self) -> Guard<'_, T> {
+		let inner = self.ptr.load(Ordering::Relaxed).cast_const();
+		unsafe { (*inner).refs.take_ref() };
+		Guard { _marker: PhantomData, inner }
 	}
 }
 
-impl<T, N: Notify> Drop for Rcu<T, N> {
+impl<T> Drop for Rcu<T> {
 	fn drop(&mut self) {
-		/* We must not forget to call `T`'s drop code when the RCU is
-		 * actually dropped.
-		 */
-		let ptr = self.ptr.load(Ordering::Relaxed);
-		drop(Inner::from_owned_ptr(ptr));
+		unsafe { drop_inner(self.ptr.load(Ordering::Relaxed)) };
 	}
 }
 
-unsafe impl<T, N: Notify> Sync for Rcu<T, N> {}
-unsafe impl<T, N: Notify> Send for Rcu<T, N> {}
+unsafe impl<T> Sync for Rcu<T> {}
+unsafe impl<T> Send for Rcu<T> {}
 
 /// The RAII guard returned by [`Rcu`].
 ///
 /// See: [`Rcu::get`].
-pub struct Guard<'a, T, N>
-where
-	N: Notify,
-{
-	inner: &'a Inner<T, N>,
+pub struct Guard<'a, T> {
+	_marker: PhantomData<&'a ()>,
+	inner: *const Inner<T>,
 }
 
-impl<'a, T, N> Deref for Guard<'a, T, N>
-where
-	N: Notify,
-{
+impl<'a, T> Deref for Guard<'a, T> {
 	type Target = T;
 
 	fn deref(&self) -> &Self::Target {
-		&self.inner.data
+		unsafe { &(*self.inner).data }
 	}
 }
 
-impl<'a, T, N> Drop for Guard<'a, T, N>
-where
-	N: Notify,
-{
+impl<'a, T> Drop for Guard<'a, T> {
 	fn drop(&mut self) {
-		let refs = self.inner.refs.fetch_sub(1, Ordering::Relaxed);
-
-		/* This check is a bit unintuitive because `fetch_sub` returns the
-		 * previous value before the subtraction. So in order to avoid
-		 * having to do an extra `load`, we use the return value.
-		 */
-		if refs == 1 {
-			self.inner.notify.notify();
-		}
+		unsafe { drop_inner(self.inner.cast_mut()) };
 	}
 }
 
-unsafe impl<T, N: Notify> Sync for Guard<'_, T, N> {}
-unsafe impl<T, N: Notify> Send for Guard<'_, T, N> {}
+unsafe impl<T> Sync for Guard<'_, T> {}
+unsafe impl<T> Send for Guard<'_, T> {}
 
-struct Inner<T, N>
-where
-	N: Notify,
-{
-	/// The number of active references to the specific `Inner`.
-	refs: AtomicUsize,
-	/// A simple notify utility. This will wake us up when told to do so.
-	notify: N,
-	/// The data.
-	data: T,
+/// Release a ref from `x` and drop it if there are no more refs.
+unsafe fn drop_inner<T>(x: *mut Inner<T>) {
+	if (*x).refs.release_ref() {
+		free(x);
+	}
 }
 
-impl<T, N> Inner<T, N>
-where
-	N: Notify,
-{
-	const fn new(data: T, notify: N) -> Self {
-		Self { refs: AtomicUsize::new(0), notify, data }
-	}
+fn alloc<T>(x: T) -> *mut T {
+	Box::into_raw(Box::new(x))
+}
 
-	fn into_owned_ptr(self) -> *mut Self {
-		let boxed = Box::new(self);
-		Box::into_raw(boxed)
-	}
-
-	fn from_owned_ptr(ptr: *mut Self) -> Self {
-		let boxed = unsafe { Box::from_raw(ptr) };
-		*boxed
-	}
+unsafe fn free<T>(x: *mut T) {
+	drop(Box::from_raw(x));
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -171,7 +118,7 @@ mod tests {
 	use std::thread::{scope, sleep};
 	use std::time::Duration;
 
-	type UserRcu = Rcu<User, crate::notify::Blocking>;
+	type UserRcu = Rcu<User>;
 
 	#[derive(Debug, PartialEq, Eq)]
 	struct User {
@@ -220,8 +167,7 @@ mod tests {
 			scope.spawn(routine(10, 7, &user, User::B));
 
 			sleep(Duration::from_secs(5));
-			let old = user.update(User::B);
-			assert_eq!(old, User::A);
+			user.update(User::B);
 		});
 	}
 }

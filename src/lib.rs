@@ -31,7 +31,7 @@
 //! use std::thread;
 //! use std::time::Duration;
 //!
-//! type Rcu<T> = rcurs::Rcu<T, rcurs::Spin>;
+//! use rcurs::Rcu;
 //!
 //! #[derive(Debug, Clone, PartialEq, Eq)]
 //! struct User {
@@ -101,13 +101,9 @@
 )]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-mod cfg;
+extern crate alloc;
 
-mod notify;
 mod rcu;
+mod refs;
 
-#[doc(inline)]
-pub use self::notify::*;
-
-#[doc(inline)]
 pub use self::rcu::{Guard, Rcu};

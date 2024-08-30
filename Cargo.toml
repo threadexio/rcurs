@@ -10,8 +10,9 @@ keywords = ["rcu", "synchronization", "concurrent", "parallel", "lock-free"]
 categories = ["concurrency"]
 
 [dependencies]
+portable-atomic = { version = "1", default-features = false }
 
 [features]
-default = ["std"]
-
 std = []
+
+default = ["std"]
