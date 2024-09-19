@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use portable_atomic::{AtomicPtr, Ordering};
 
 use crate::refs::Refs;
+use crate::spin::Spinlock;
 
 struct Inner<T> {
 	/// The number of active references to the specific `Inner`.
@@ -16,13 +17,15 @@ struct Inner<T> {
 /// The RCU implementation.
 pub struct Rcu<T> {
 	ptr: AtomicPtr<Inner<T>>,
+	// A lock that guarantees `ptr` cannot be dropped while it is held.
+	lock_inner: Spinlock,
 }
 
 impl<T> Rcu<T> {
 	/// Create a new [`Rcu`] with an initial value of `data`.
 	pub fn new(data: T) -> Self {
 		let ptr = alloc(Inner { data, refs: Refs::one() });
-		Self { ptr: AtomicPtr::new(ptr) }
+		Self { ptr: AtomicPtr::new(ptr), lock_inner: Spinlock::new() }
 	}
 
 	/// Update the value inside the [`Rcu`] and return the old one.
@@ -37,8 +40,11 @@ impl<T> Rcu<T> {
 	/// [`update`]: Self::update
 	pub fn update(&self, new: T) {
 		let new_ptr = alloc(Inner { data: new, refs: Refs::one() });
-		let old_ptr = self.ptr.swap(new_ptr, Ordering::Relaxed);
-		unsafe { drop_inner(old_ptr) };
+
+		self.lock_inner.with(|| {
+			let old_ptr = self.ptr.swap(new_ptr, Ordering::Relaxed);
+			unsafe { drop_inner(old_ptr) };
+		});
 	}
 
 	/// Get the value inside the [`Rcu`].
@@ -56,9 +62,14 @@ impl<T> Rcu<T> {
 	///
 	/// [`update`]: Self::update
 	pub fn get(&self) -> Guard<'_, T> {
-		let inner = self.ptr.load(Ordering::Relaxed).cast_const();
-		unsafe { (*inner).refs.take_ref() };
-		Guard { _marker: PhantomData, inner }
+		self.lock_inner.with(|| {
+			let inner = self.ptr.load(Ordering::Relaxed).cast_const();
+
+			std::thread::sleep(std::time::Duration::from_secs(2));
+
+			unsafe { (*inner).refs.take_ref() };
+			Guard { _marker: PhantomData, inner }
+		})
 	}
 }
 
@@ -168,6 +179,23 @@ mod tests {
 
 			sleep(Duration::from_secs(5));
 			user.update(User::B);
+		});
+	}
+
+	#[test]
+	fn test_ref_count_race() {
+		let rcu = Rcu::new(42);
+
+		scope(|scope| {
+			scope.spawn(|| {
+				let val = rcu.get();
+				assert_eq!(*val, 42);
+			});
+
+			scope.spawn(|| {
+				sleep(Duration::from_secs(1));
+				rcu.update(32);
+			});
 		});
 	}
 }

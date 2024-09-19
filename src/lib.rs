@@ -105,5 +105,6 @@ extern crate alloc;
 
 mod rcu;
 mod refs;
+mod spin;
 
 pub use self::rcu::{Guard, Rcu};
