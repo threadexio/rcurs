@@ -16,6 +16,11 @@ impl Refs {
 		Self { refs: AtomicUsize::new(1) }
 	}
 
+	/// Get the number of references taken.
+	pub fn count(&self) -> usize {
+		self.refs.load(Ordering::Acquire)
+	}
+
 	/// Increment the ref count by one.
 	pub fn take_ref(&self) {
 		let old_refs = self.refs.fetch_add(1, Ordering::Relaxed);

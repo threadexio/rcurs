@@ -1,4 +1,5 @@
-use core::{marker::PhantomData, ops::Deref};
+use core::marker::PhantomData;
+use core::ops::Deref;
 
 use alloc::boxed::Box;
 
@@ -14,18 +15,28 @@ struct Inner<T> {
 	data: T,
 }
 
+impl<T> Inner<T> {
+	fn new(data: T) -> *mut Self {
+		alloc(Self { refs: Refs::new(), data })
+	}
+}
+
 /// The RCU implementation.
 pub struct Rcu<T> {
 	ptr: AtomicPtr<Inner<T>>,
-	// A lock that guarantees `ptr` cannot be dropped while it is held.
-	lock_inner: Spinlock,
+
+	// A lock that protects `ptr` from being free'd before its ref count can be
+	// incremented.
+	lock: Spinlock,
 }
 
 impl<T> Rcu<T> {
 	/// Create a new [`Rcu`] with an initial value of `data`.
 	pub fn new(data: T) -> Self {
-		let ptr = alloc(Inner { data, refs: Refs::one() });
-		Self { ptr: AtomicPtr::new(ptr), lock_inner: Spinlock::new() }
+		Self {
+			ptr: AtomicPtr::new(Inner::new(data)),
+			lock: Spinlock::new(),
+		}
 	}
 
 	/// Update the value inside the [`Rcu`] and return the old one.
@@ -34,17 +45,19 @@ impl<T> Rcu<T> {
 	/// [`update`] returns. You must make sure that when calling this function
 	/// the new value is fully initialized beforehand.
 	///
-	/// This function does _not_ block execution.
-	///
 	/// [`get`]: Self::get
 	/// [`update`]: Self::update
 	pub fn update(&self, new: T) {
-		let new_ptr = alloc(Inner { data: new, refs: Refs::one() });
+		let new_ptr = Inner::new(new);
+		let old_ptr = self.ptr.swap(new_ptr, Ordering::Relaxed);
+		// From this point and on, no new references to `old_ptr` can be created.
 
-		self.lock_inner.with(|| {
-			let old_ptr = self.ptr.swap(new_ptr, Ordering::Relaxed);
-			unsafe { drop_inner(old_ptr) };
-		});
+		// If any other thread is executing `Rcu::get` with the old pointer and it has not
+		// incremented the old ref count, we wait. There is a possibility that this waits
+		// for threads executing `Rcu::get` after the atomic swap of `self.ptr` (which is
+		// unnecessary), but the cost is very minimal.
+		self.lock.with(|| {});
+		drop_reclaim_inner(old_ptr);
 	}
 
 	/// Get the value inside the [`Rcu`].
@@ -62,25 +75,65 @@ impl<T> Rcu<T> {
 	///
 	/// [`update`]: Self::update
 	pub fn get(&self) -> Guard<'_, T> {
-		self.lock_inner.with(|| {
-			let inner = self.ptr.load(Ordering::Relaxed).cast_const();
+		// Getting a reference to the value inside the RCU is a 2 step process. First, you
+		// have to read the pointer to the `Inner` struct (which holds the value). Afterwards,
+		// you need to dereference that pointer and increment the ref count (also inside
+		// the `Inner` struct).
 
-			std::thread::sleep(std::time::Duration::from_secs(2));
+		// In some rare cases it is possible that the thread trying to get the value reads
+		// the pointer to the `Inner` struct and in the time it takes to dereference the
+		// pointer and increment the ref count (since this operation is not atomic) another
+		// thread `update`s the value and deallocates the `Inner` struct since it sees that
+		// it has no references. However, the thread getting the value has read the
+		// now-deallocated pointer and tries to dereference it and disaster in the form of
+		// a use-after-free bug occurs. For this reason, we use a simple spinlock that
+		// protects the time frame between reading the pointer and incrementing the ref
+		// count. This time frame is very short (as long as it takes the CPU to do a memory
+		// dereference and an atomic increment), so any other thread should never spin for
+		// long.
+		//
+		// See issue #1: https://github.com/threadexio/rcurs/issues/1
+		let ptr = self.lock.with(|| unsafe {
+			let ptr = self.ptr.load(Ordering::Relaxed);
 
-			unsafe { (*inner).refs.take_ref() };
-			Guard { _marker: PhantomData, inner }
-		})
+			// See: `tests::test_issue_1_rcu_race_in_get`
+			#[cfg(test)]
+			std::thread::sleep(std::time::Duration::from_millis(150));
+
+			(*ptr).refs.take_ref();
+			ptr
+		});
+
+		Guard::new(ptr)
 	}
 }
 
 impl<T> Drop for Rcu<T> {
 	fn drop(&mut self) {
-		unsafe { drop_inner(self.ptr.load(Ordering::Relaxed)) };
+		let ptr = self.ptr.load(Ordering::Relaxed);
+
+		// See the comment in `Rcu::update`.
+		self.lock.with(|| {});
+		drop_reclaim_inner(ptr);
 	}
 }
 
 unsafe impl<T> Sync for Rcu<T> {}
 unsafe impl<T> Send for Rcu<T> {}
+
+fn drop_reclaim_inner<T>(ptr: *mut Inner<T>) -> T {
+	unsafe {
+		let inner = &*ptr;
+
+		// TODO: Find some better way to wait until all references have been dropped.
+		while inner.refs.count() > 1 {
+			core::hint::spin_loop();
+		}
+
+		let Inner { data, .. } = dealloc(ptr);
+		data
+	}
+}
 
 /// The RAII guard returned by [`Rcu`].
 ///
@@ -98,28 +151,36 @@ impl<'a, T> Deref for Guard<'a, T> {
 	}
 }
 
+impl<'a, T> Guard<'a, T> {
+	fn new(inner: *const Inner<T>) -> Self {
+		Self { _marker: PhantomData, inner }
+	}
+}
+
 impl<'a, T> Drop for Guard<'a, T> {
 	fn drop(&mut self) {
-		unsafe { drop_inner(self.inner.cast_mut()) };
+		unsafe {
+			let ptr = self.inner.cast_mut();
+
+			// SAFETY: When this `Guard` was created a reference was taken, we now need to
+			//         give back that reference. We are releasing our own reference here.
+			let _ = (*ptr).refs.release_ref();
+
+			// It is not the `Guard`'s responsibility to free the underlying memory,
+			// so we don't have to do anything else.
+		}
 	}
 }
 
 unsafe impl<T> Sync for Guard<'_, T> {}
 unsafe impl<T> Send for Guard<'_, T> {}
 
-/// Release a ref from `x` and drop it if there are no more refs.
-unsafe fn drop_inner<T>(x: *mut Inner<T>) {
-	if (*x).refs.release_ref() {
-		free(x);
-	}
-}
-
 fn alloc<T>(x: T) -> *mut T {
 	Box::into_raw(Box::new(x))
 }
 
-unsafe fn free<T>(x: *mut T) {
-	drop(Box::from_raw(x));
+unsafe fn dealloc<T>(x: *mut T) -> T {
+	*Box::from_raw(x)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -182,18 +243,21 @@ mod tests {
 		});
 	}
 
+	// Issue: https://github.com/threadexio/rcurs/issues/1
 	#[test]
-	fn test_ref_count_race() {
+	fn test_issue_1_rcu_race_in_get() {
 		let rcu = Rcu::new(42);
 
 		scope(|scope| {
 			scope.spawn(|| {
+				// We need `get` to delay incrementing the ref count in order to give time
+				// to the other thread to update the value and allow the race to occur.
 				let val = rcu.get();
 				assert_eq!(*val, 42);
 			});
 
 			scope.spawn(|| {
-				sleep(Duration::from_secs(1));
+				sleep(Duration::from_millis(100));
 				rcu.update(32);
 			});
 		});
